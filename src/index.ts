@@ -9,6 +9,8 @@ import {
     AssistantClientCustomizedCommand,
     AssistantSmartAppData,
     AssistantClientCommand,
+    AssistantSmartAppError,
+    AssistantSmartAppCommand,
 } from './typings';
 import { createNanoEvents } from './nanoevents';
 import { initializeAssistantSDK } from './dev';
@@ -18,12 +20,23 @@ import { createNanoObservable, ObserverFunc } from './nanoobservable';
 export interface AssistantEvents<A extends AssistantSmartAppData> {
     start: () => void;
     data: (command: AssistantClientCustomizedCommand<A>) => void;
+    command: <T extends AssistantSmartAppCommand['smart_app_data'] = AssistantSmartAppCommand['smart_app_data']>(
+        data: T,
+    ) => void;
+    error: <T extends AssistantSmartAppError['smart_app_error'] = AssistantSmartAppError['smart_app_error']>(
+        error: T,
+    ) => void;
 }
 
 export interface SendDataParams {
     action: AssistantServerAction;
     name?: string;
     requestId?: string;
+}
+
+interface SendActionEvents<D extends {}, E extends {}> {
+    data: (data: D, clear: () => void) => void;
+    error: (error: E, clear: () => void) => void;
 }
 
 export const createAssistant = <A extends AssistantSmartAppData>({
@@ -38,7 +51,7 @@ export const createAssistant = <A extends AssistantSmartAppData>({
     const { on, emit } = createNanoEvents<AssistantEvents<A>>();
     const startedAppInitialData: AssistantClientCommand[] = [...(window.appInitialData || [])];
     const initialData: AssistantClientCommand[] = [...window.appInitialData];
-    const observables = new Map<string, { next: ObserverFunc<A>; requestId?: string }>();
+    const observables = new Map<string, { next: ObserverFunc<A | AssistantSmartAppError>; requestId?: string }>();
 
     window.AssistantClient = {
         onData: (command: any) => {
@@ -63,7 +76,7 @@ export const createAssistant = <A extends AssistantSmartAppData>({
             }
 
             if (
-                command.type === 'smart_app_data' &&
+                (command.type === 'smart_app_data' || command.type === 'smart_app_error') &&
                 command.sdkMeta?.requestId &&
                 observables.has(command.sdkMeta.requestId)
             ) {
@@ -78,8 +91,16 @@ export const createAssistant = <A extends AssistantSmartAppData>({
                         result.sdkMeta = { requestId };
                     }
                 }
-                next(result as A);
+                next(result);
                 return;
+            }
+
+            if (command.type === 'smart_app_data') {
+                emit('command', command.smart_app_data);
+            }
+
+            if (command.type === 'smart_app_error') {
+                emit('error', command.smart_app_error);
             }
 
             return emit('data', command as A);
@@ -98,47 +119,93 @@ export const createAssistant = <A extends AssistantSmartAppData>({
     };
     setTimeout(() => window.AssistantHost?.ready()); // таймаут для подписки на start
 
+    const sendData = (
+        { action, name, requestId }: SendDataParams,
+        onData?: ObserverFunc<A | AssistantSmartAppError>,
+    ): (() => void) => {
+        if (window.AssistantHost?.sendDataContainer) {
+            if (onData == null) {
+                window.AssistantHost?.sendDataContainer(
+                    /* eslint-disable-next-line @typescript-eslint/camelcase */
+                    JSON.stringify({ data: action, message_name: name || '', requestId }),
+                );
+                return () => {};
+            }
+
+            if (requestId && observables.has(requestId)) {
+                throw new Error('requestId должен быть уникальным');
+            }
+
+            const { subscribe } = createNanoObservable<A>(({ next }) => {
+                const realRequestId = requestId || v4();
+
+                window.AssistantHost?.sendDataContainer(
+                    /* eslint-disable-next-line @typescript-eslint/camelcase */
+                    JSON.stringify({ data: action, message_name: name || '', requestId: realRequestId }),
+                );
+
+                observables.set(realRequestId, { next, requestId });
+            });
+
+            return subscribe({ next: onData }).unsubscribe;
+        }
+
+        if (onData != null) {
+            throw new Error('Не поддерживается в данной версии клиента');
+        }
+
+        window.AssistantHost?.sendData(JSON.stringify(action), name || null);
+
+        return () => {};
+    };
+
     return {
         close: () => window.AssistantHost?.close(),
         getInitialData: () => startedAppInitialData,
         getRecoveryState: () => window.appRecoveryState,
         on,
-        sendData: ({ action, name, requestId }: SendDataParams, onData?: ObserverFunc<A>): (() => void) => {
-            if (window.AssistantHost?.sendDataContainer) {
-                if (onData == null) {
-                    window.AssistantHost?.sendDataContainer(
-                        /* eslint-disable-next-line @typescript-eslint/camelcase */
-                        JSON.stringify({ data: action, message_name: name || '', requestId }),
-                    );
-                    return () => {};
-                }
+        sendAction: <
+            D extends AssistantSmartAppCommand['smart_app_data'] = AssistantSmartAppCommand['smart_app_data'],
+            E extends AssistantSmartAppError['smart_app_error'] = AssistantSmartAppError['smart_app_error']
+        >(
+            {
+                type,
+                payload,
+            }: {
+                type: string;
+                payload: Record<string, unknown>;
+            },
+            { name, requestId }: Pick<SendDataParams, 'name' | 'requestId'> = {},
+        ) => {
+            const { on, emit, clear } = createNanoEvents<SendActionEvents<D, E>>();
 
-                if (requestId && observables.has(requestId)) {
-                    throw new Error('requestId должен быть уникальным');
-                }
+            const unsubscribe = sendData(
+                { action: { type, payload }, name, requestId },
+                (data: A | AssistantSmartAppError) => {
+                    if (data.type === 'smart_app_data') {
+                        emit('data', data.smart_app_data as D, () => {
+                            clear();
+                            unsubscribe();
+                        });
+                    } else if (data.type === 'smart_app_error') {
+                        emit('error', data.smart_app_error as E, () => {
+                            clear();
+                            unsubscribe();
+                        });
+                    }
+                },
+            );
 
-                const { subscribe } = createNanoObservable<A>(({ next }) => {
-                    const realRequestId = requestId || v4();
+            const result = {
+                on: (event: keyof SendActionEvents<D, E>, cb: SendActionEvents<D, E>[keyof SendActionEvents<D, E>]) => {
+                    on(event, cb);
+                    return result;
+                },
+            };
 
-                    window.AssistantHost?.sendDataContainer(
-                        /* eslint-disable-next-line @typescript-eslint/camelcase */
-                        JSON.stringify({ data: action, message_name: name || '', requestId: realRequestId }),
-                    );
-
-                    observables.set(realRequestId, { next, requestId });
-                });
-
-                return subscribe({ next: onData }).unsubscribe;
-            }
-
-            if (onData != null) {
-                throw new Error('Не поддерживается в данной версии клиента');
-            }
-
-            window.AssistantHost?.sendData(JSON.stringify(action), name || null);
-
-            return () => {};
+            return result;
         },
+        sendData,
         setGetState: (nextGetState: () => {}) => {
             currentGetState = nextGetState;
         },
